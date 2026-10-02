@@ -15,9 +15,9 @@ behavior.
 
 ## 1. Problem Statement
 
-Symphony is a long-running automation service that continuously reads work from a configured issue
-tracker, creates an isolated workspace for each issue, and runs a coding agent session for that
-issue inside the workspace.
+Symphony is a long-running automation service that continuously reads work from a configured
+GitHub Projects board, creates an isolated workspace for each issue, and runs an oh-my-pi coding
+agent session for that issue inside the workspace.
 
 The service solves four operational problems:
 
@@ -105,7 +105,7 @@ Important boundary:
 6. `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
+   - Launches the oh-my-pi RPC client.
    - Streams agent updates back to the orchestrator.
 
 7. `Status Surface` (OPTIONAL)
@@ -142,10 +142,10 @@ Symphony is easiest to port when kept in these layers:
 
 ### 3.3 External Dependencies
 
-- One configured issue tracker API.
+- GitHub GraphQL API for a configured GitHub Projects (`ProjectV2`) board.
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
-- Coding-agent executable that supports the targeted Codex app-server mode.
+- oh-my-pi executable (`omp`) that supports the targeted RPC mode.
 - Host environment authentication for the issue tracker and coding agent. Host-side tracker secret
   environment variables SHOULD NOT be inherited by the coding-agent child process.
 
@@ -169,7 +169,7 @@ Fields:
   - OPTIONAL non-secret provider identifiers needed by provider-native tools.
   - Opaque to the orchestrator and preserved for prompt/tool context.
 - `identifier` (string)
-  - REQUIRED human-readable ticket key (example: `ABC-123`).
+  - REQUIRED human-readable ticket key (example: `octo-org/example#123`).
   - MUST be unique within the configured tracker scope because it names workspaces and
     operator-facing routes. An adapter spanning multiple namespaces MUST disambiguate it.
 - `title` (string)
@@ -248,16 +248,16 @@ State tracked while a coding-agent subprocess is running.
 
 Fields:
 
-- `session_id` (string, `<thread_id>-<turn_id>`)
-- `thread_id` (string)
-- `turn_id` (string)
-- `codex_app_server_pid` (string or null)
-- `last_codex_event` (string/enum or null)
-- `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
-- `codex_input_tokens` (integer)
-- `codex_output_tokens` (integer)
-- `codex_total_tokens` (integer)
+- `session_id` (string, `<omp_session_id>-<turn_id>`)
+- `omp_session_id` (string, from RPC `get_state.data.sessionId`)
+- `turn_id` (string, host-generated `prompt` request ID)
+- `omp_pid` (string or null)
+- `last_omp_event` (string/enum or null)
+- `last_omp_timestamp` (timestamp or null)
+- `last_omp_message` (summarized payload)
+- `omp_input_tokens` (integer)
+- `omp_output_tokens` (integer)
+- `omp_total_tokens` (integer)
 - `last_reported_input_tokens` (integer)
 - `last_reported_output_tokens` (integer)
 - `last_reported_total_tokens` (integer)
@@ -289,8 +289,8 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `codex_totals` (aggregate tokens + runtime seconds)
-- `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- `omp_totals` (aggregate tokens + runtime seconds)
+- `omp_rate_limits` (latest provider rate-limit snapshot, or null when unavailable)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -313,7 +313,8 @@ Fields:
 - `Normalized Issue State`
   - Compare states after trimming surrounding whitespace and applying `lowercase`.
 - `Session ID`
-  - Compose from coding-agent `thread_id` and `turn_id` as `<thread_id>-<turn_id>`.
+  - Compose from `omp_session_id` and the host-generated `turn_id` as
+    `<omp_session_id>-<turn_id>`.
 
 ## 5. Workflow Specification (Repository Contract)
 
@@ -361,7 +362,7 @@ Top-level keys:
 - `workspace`
 - `hooks`
 - `agent`
-- `codex`
+- `omp`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -379,6 +380,8 @@ Fields:
 - `kind` (string)
   - REQUIRED for dispatch.
   - Selects one implementation-supported tracker adapter.
+  - This specification REQUIRES `github_projects`, the GitHub Projects board profile in Section 11.6.
+    Implementations MAY support additional adapters.
 - `provider` (object)
   - Default: `{}`.
   - Adapter-owned configuration such as endpoint, scope/project selector, and credentials.
@@ -398,6 +401,10 @@ Fields:
 - `terminal_states` (list of strings)
   - REQUIRED unless the selected adapter profile documents a default.
   - Values are provider-native state names compared case-insensitively by the scheduler.
+
+For `github_projects`, state names are options in the board's configured single-select Status
+field, not the underlying GitHub issue's `OPEN`/`CLOSED` state. Defaults and provider keys are
+defined in Section 11.6.
 
 #### 5.3.2 `polling` (object)
 
@@ -460,28 +467,20 @@ Fields:
   - State keys are normalized (`trim + lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `codex` (object)
+#### 5.3.6 `omp` (object)
 
 Fields:
 
-For Codex-owned config values such as `approval_policy`, `thread_sandbox`, and
-`turn_sandbox_policy`, supported values are defined by the targeted Codex app-server version.
-Implementors SHOULD treat them as pass-through Codex config values rather than relying on a
-hand-maintained enum in this spec. To inspect the installed Codex schema, run
-`codex app-server generate-json-schema --out <dir>` and inspect the relevant definitions referenced
-by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`. Implementations MAY validate these
-fields locally if they want stricter startup checks.
-
 - `command` (string shell command)
-  - Default: `codex app-server`
+  - Default: `omp --mode rpc --no-ui`
   - The runtime launches this command via `bash -lc` in the workspace directory.
-  - The launched process MUST speak a compatible app-server protocol over stdio.
-- `approval_policy` (Codex `AskForApproval` value)
-  - Default: implementation-defined.
-- `thread_sandbox` (Codex `SandboxMode` value)
-  - Default: implementation-defined.
-- `turn_sandbox_policy` (Codex `SandboxPolicy` value)
-  - Default: implementation-defined.
+  - The launched process MUST speak the targeted oh-my-pi RPC protocol over stdio.
+  - Model selection, thinking level, tool restrictions, and approval settings MAY be supplied
+    through supported oh-my-pi CLI options or its native configuration.
+  - The effective cwd MUST remain the issue workspace; command options MUST NOT redirect it.
+  - `--no-ui` runs extensions headless; tools requiring interactive approval fail closed unless
+    the deployment explicitly configures a supported non-interactive approval policy.
+  - RPC mode is not an OS sandbox. Implementations MUST document host isolation and approval policy.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
@@ -564,7 +563,7 @@ Dynamic reload is REQUIRED:
 - The software MUST detect `WORKFLOW.md` changes.
 - On change, it MUST re-read and re-apply workflow config and prompt template without restart.
 - The software MUST attempt to adjust live behavior to the new config (for example polling
-  cadence, concurrency limits, active/terminal states, codex settings, workspace paths/hooks, and
+  cadence, concurrency limits, active/terminal states, oh-my-pi settings, workspace paths/hooks, and
   prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
   execution, and agent launches.
@@ -600,7 +599,7 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
-- `codex.command` is present and non-empty.
+- `omp.command` is present and non-empty.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -608,11 +607,11 @@ This section is intentionally redundant so a coding agent can implement the conf
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
 
-- `tracker.kind`: string, REQUIRED, selects one supported adapter
-- `tracker.provider`: object, default `{}`, adapter-owned endpoint/scope/auth settings
+- `tracker.kind`: string, REQUIRED; `github_projects` MUST be supported
+- `tracker.provider`: object; for `github_projects`, requires `project_id` and host-side auth
 - `tracker.required_labels`: list of strings, default `[]`
-- `tracker.active_states`: list of provider-native state names, adapter-defined default
-- `tracker.terminal_states`: list of provider-native state names, adapter-defined default
+- `tracker.active_states`: board Status option names, default `["Todo", "In Progress"]`
+- `tracker.terminal_states`: board Status option names, default `["Done"]`
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
@@ -624,13 +623,10 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `codex.command`: shell command string, default `codex app-server`
-- `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
-- `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
-- `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
-- `codex.turn_timeout_ms`: integer, default `3600000`
-- `codex.read_timeout_ms`: integer, default `5000`
-- `codex.stall_timeout_ms`: integer, default `300000`
+- `omp.command`: shell command string, default `omp --mode rpc --no-ui`
+- `omp.turn_timeout_ms`: integer, default `3600000`
+- `omp.read_timeout_ms`: integer, default `5000`
+- `omp.stall_timeout_ms`: integer, default `300000`
 
 ## 7. Orchestration State Machine
 
@@ -665,10 +661,10 @@ Important nuance:
 - The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
 - After each normal turn completion, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
+  oh-my-pi session in the same workspace, up to `agent.max_turns`.
 - The first turn SHOULD use the full rendered task prompt.
-- Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
+- Continuation turns SHOULD send only continuation guidance to the existing session, not resend the
+  original task prompt that is already present in session history.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
@@ -710,8 +706,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule exponential-backoff retry.
 
-- `Codex Update Event`
-  - Update live session fields, token counters, and rate limits.
+- `Oh-my-pi Update Event`
+  - Update live session fields, token counters, and rate limits when available.
 
 - `Retry Timer Fired`
   - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
@@ -823,9 +819,9 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
+  - `last_omp_timestamp` if any event has been seen, else
   - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- If `elapsed_ms > omp.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
 Part B: Tracker state refresh
@@ -947,177 +943,154 @@ Invariant 3: Workspace key is sanitized.
 - If replacement changes the identifier, append a stable original-identifier hash suffix with at
   least 64 bits of entropy so keys remain collision-resistant after sanitization.
 
-## 10. Agent Runner Protocol (Coding Agent Integration)
+## 10. Agent Runner Protocol (Oh-my-pi Integration)
 
-This section defines Symphony's language-neutral responsibilities when integrating a Codex
-app-server. The Codex app-server protocol for the targeted Codex version is the source of truth for
-protocol schemas, message payloads, transport framing, and method names.
+This section defines Symphony's language-neutral responsibilities when integrating oh-my-pi.
+The targeted oh-my-pi version's RPC documentation and types are the source of truth for message
+payloads, transport framing, and command names:
 
-Protocol source of truth:
+- [RPC protocol reference](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md)
+- [Canonical RPC types](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/rpc/rpc-types.ts)
 
-- Implementations MUST send messages that are valid for the targeted Codex app-server version.
-- Implementations MUST consult the targeted Codex app-server documentation or generated schema
-  instead of treating this specification as a protocol schema.
-- If this specification appears to conflict with the targeted Codex app-server protocol, the Codex
-  protocol controls protocol shape and transport behavior.
-- Symphony-specific requirements in this section still control orchestration behavior, workspace
-  selection, prompt construction, continuation handling, and observability extraction.
+Implementations MUST document the targeted oh-my-pi version and send valid commands for that
+version. If this specification conflicts with the targeted protocol, that protocol controls wire
+shape and transport behavior. Symphony's requirements still control scheduling, workspace
+selection, prompts, continuation, and observability.
 
 ### 10.1 Launch Contract
 
 Subprocess launch parameters:
 
-- Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
-- Working directory: workspace path
-- Transport/framing: the protocol transport required by the targeted Codex app-server version
+- Command: `omp.command`
+- Invocation: `bash -lc <omp.command>`
+- Default: `omp --mode rpc --no-ui`
+- Working directory: absolute issue workspace path
+- Transport: newline-delimited JSON over stdin/stdout, not JSON-RPC 2.0
+- Diagnostics: stderr, separate from the protocol stream
 
-Notes:
-
-- The default command is `codex app-server`.
-- Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
-  using fields supported by the targeted Codex app-server version.
-
-RECOMMENDED additional process settings:
-
-- Max line size: 10 MB (for safe buffering)
+The client MUST wait for the `ready` frame and respect its advertised transport limits.
+It SHOULD negotiate protocol v2 with `negotiate_protocol` when supported, to preserve oversized
+output losslessly. A v2 client MUST validate and reassemble `rpc_chunk` frames according to the
+targeted protocol, including sequence order, byte lengths, UTF-8 validity, and reassembly limits.
+Inbound commands remain unchunked JSONL objects and MUST fit the advertised physical-frame limit.
+Transport overflow or invalid chunk sequences MUST surface as failures, not successful truncated
+results.
 
 ### 10.2 Session Startup Responsibilities
 
-Reference: https://developers.openai.com/codex/app-server/
+The client MUST:
 
-Startup MUST follow the targeted Codex app-server contract. Symphony additionally requires the
-client to:
+- Start the RPC subprocess in the per-issue workspace with tracker secrets removed from its
+  environment.
+- Create a fresh session with `new_session`, or explicitly resume a session previously bound to
+  this issue using a supported session command. A cancelled session transition is a startup
+  failure. Never implicitly adopt another issue's history.
+- Send `get_state` and extract `data.sessionId` as `omp_session_id`.
+- Register implemented host tools with `set_host_tools` before sending the first prompt.
+- Start the first turn with a uniquely identified `prompt` command containing the rendered issue
+  prompt in `message`.
+- Send later continuation prompts on the same session with continuation guidance rather than
+  resending the original task.
+- Apply the deployment's documented oh-my-pi CLI/configuration and host isolation policy.
 
-- Start the app-server subprocess in the per-issue workspace.
-- Initialize the app-server session using the targeted Codex app-server protocol.
-- Create or resume a coding-agent thread according to the targeted protocol.
-- Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
-  targeted protocol accepts cwd.
-- Start the first turn with the rendered issue prompt.
-- Start later in-worker continuation turns on the same live thread with continuation guidance rather
-  than resending the original issue prompt.
-- Supply the implementation's documented approval and sandbox policy using fields supported by the
-  targeted protocol.
-- Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
-  protocol supports turn or session titles.
-- Advertise implemented client-side tools using the targeted protocol.
+The client MAY set a session name using `set_session_name`, for example
+`<issue.identifier>: <issue.title>`.
 
 Session identifiers:
 
-- Extract `thread_id` from the thread identity returned by the targeted Codex app-server protocol.
-- Extract `turn_id` from each turn identity returned by the targeted Codex app-server protocol.
-- Emit `session_id = "<thread_id>-<turn_id>"`
-- Reuse the same `thread_id` for all continuation turns inside one worker run
+- `omp_session_id` is the native oh-my-pi session ID, retained across in-worker continuations.
+- `turn_id` is the host-generated `id` of a `prompt` command; oh-my-pi does not return a separate
+  server-side turn ID for Symphony to use.
+- Emit `session_id = "<omp_session_id>-<turn_id>"` for each Symphony turn.
+- Correlate command responses and `prompt_result` frames by `id`, not arrival order.
 
 ### 10.3 Streaming Turn Processing
 
-The client processes app-server updates according to the targeted Codex app-server protocol until
-the active turn terminates.
+A Symphony turn is one submitted prompt plus all background activity it causes before the session
+settles. It can span several oh-my-pi model turns and agent runs. `agent.max_turns` limits submitted
+Symphony prompts, not individual `turn_end` events.
 
-Completion conditions:
+The client MUST keep reading RPC output and servicing host-tool requests while the prompt runs:
 
-- Targeted-protocol turn completion signal -> success
-- Targeted-protocol turn failure signal -> failure
-- Targeted-protocol turn cancellation signal -> failure
-- turn stream silence timeout (`turn_timeout_ms`) -> failure
-- subprocess exit -> failure
+- A successful `response` to `prompt` acknowledges admission; it is not agent completion.
+- A success response with `data.agentInvoked: false` completes a local-only command without a
+  later `prompt_result`.
+- Otherwise, wait for the matching `prompt_result`. `status: "error"` fails the turn;
+  `status: "aborted"` cancels it; `status: "completed"` reports the agent's yield.
+- A completed result with `sessionSettled: false` is not safe for continuation or shutdown.
+  Continue consuming background runs until `session_settled` or `get_state.data.isSettled` is true.
+  Errors in those background runs MUST still fail the attempt.
+- Neither an arbitrary `turn_end` nor `agent_end` is sufficient proof of prompt completion or
+  session quiescence.
+- A failed command response, transport failure, stream silence timeout, or unexpected subprocess
+  exit fails the attempt.
 
-Continuation processing:
+After successful completion and quiescence, refresh the issue and decide whether to submit another
+prompt. Keep the same subprocess and session alive across in-worker continuations.
 
-- If the worker decides to continue after a successful turn, it SHOULD start another turn on the same
-  live thread using the targeted protocol.
-- The app-server subprocess SHOULD remain alive across those continuation turns and be stopped only
-  when the worker run is ending.
-
-Transport handling requirements:
-
-- Follow the transport and framing rules of the targeted Codex app-server version.
-- For stdio-based transports, keep protocol stream handling separate from diagnostic stderr
-  handling unless the targeted protocol specifies otherwise.
+On cancellation, send `abort` when possible and terminate the process if it does not stop within
+the implementation's documented shutdown deadline. On normal shutdown, close stdin and continue
+draining stdout until EOF; use a bounded shutdown deadline rather than waiting indefinitely.
 
 ### 10.4 Emitted Runtime Events (Upstream to Orchestrator)
 
-The app-server client emits structured events to the orchestrator callback. Each event SHOULD
-include:
+The RPC client emits structured events to the orchestrator callback. Each event SHOULD include:
 
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
-- `codex_app_server_pid` (if available)
-- OPTIONAL `usage` map (token counts)
+- `omp_pid` (if available)
+- `session_id` and `turn_id` when associated with a prompt
+- OPTIONAL `usage` map (normalized token counts)
 - payload fields as needed
 
-Important emitted events include, for example:
+Important normalized events include:
 
 - `session_started`
 - `startup_failed`
-- `turn_completed`
+- `turn_completed` (only after completion and session quiescence)
 - `turn_failed`
 - `turn_cancelled`
 - `turn_ended_with_error`
 - `turn_input_required`
-- `approval_auto_approved`
 - `unsupported_tool_call`
 - `notification`
 - `other_message`
 - `malformed`
 
-### 10.5 Approval, Tool Calls, and User Input Policy
+Message, tool-execution, compaction, retry, and background-work updates SHOULD refresh liveness.
+Token counts MUST follow Section 13.5. Rate-limit metadata is OPTIONAL; do not invent a native
+rate-limit event when the targeted oh-my-pi version does not expose one.
 
-Approval, sandbox, and user-input behavior is implementation-defined.
+### 10.5 Approval, Host Tools, and User Input Policy
 
-Policy requirements:
+Each implementation MUST document its approval, sandbox, and operator-confirmation posture.
+Use oh-my-pi's supported CLI/configuration for tool approvals and external isolation when needed;
+the RPC protocol does not supply per-thread or per-turn sandbox policy objects.
 
-- Each implementation MUST document its chosen approval, sandbox, and operator-confirmation
-  posture.
-- Approval requests and user-input-required events MUST NOT leave a run stalled indefinitely. An
-  implementation MAY either satisfy them, surface them to an operator, auto-resolve them, or
-  fail the run according to its documented policy.
+The default `--mode rpc --no-ui` is headless. Interactive tool approvals fail closed, and extension
+dialogs use their headless defaults. Implementations MUST evaluate those defaults rather than
+equating headless mode with automatic approval. A deployment that uses `rpc-ui` or another supported
+interactive policy MUST handle `extension_ui_request` dialogs through matching
+`extension_ui_response` frames or fail the run; it MUST NOT wait indefinitely for user input.
+Presentation-only UI notifications do not require responses.
 
-Example high-trust behavior:
+OPTIONAL provider-native host-tool extension:
 
-- Auto-approve command execution approvals for the session.
-- Auto-approve file-change approvals for the session.
-- Treat user-input-required turns as hard failure.
-
-Unsupported dynamic tool calls:
-
-- Supported dynamic tool calls that are explicitly implemented and advertised by the runtime SHOULD
-  be handled according to their extension contract.
-- If the agent requests a dynamic tool call that is not supported, return a tool failure response
-  using the targeted protocol and continue the session.
-- This prevents the session from stalling on unsupported tool execution paths.
-
-Optional provider-native agent tool extension:
-
-- An adapter MAY expose provider-native tools to the app-server session.
-- The selected adapter's tool specs SHOULD be advertised during session startup using the protocol
-  mechanism supported by the targeted Codex app-server version.
-- Tool specs, adapter selection, and effective tracker settings MUST be bound to one session
-  snapshot. A workflow reload applies to future sessions; it MUST NOT make an in-flight session
-  advertise one provider and execute another.
-- Tool names, schemas, and result payloads are adapter-owned. Symphony does not standardize a
-  lowest-common-denominator CRUD API.
-- The runtime MUST execute advertised tool calls host-side with the active adapter configuration and
-  MUST NOT require the coding-agent child process to read raw tracker tokens from disk or
-  environment.
-- The runtime SHOULD pass the current normalized issue to the adapter as internal execution context.
-  The adapter MAY use `issue.id` and `issue.native_ref` to preserve provider-specific richness
-  without teaching the orchestrator provider semantics.
-- Tracker credentials SHOULD NOT be inherited by the coding-agent child process. An adapter that
-  resolves credentials from environment variables MUST declare authentication-related environment
-  names for removal from local and remote child environments. Implementations SHOULD consult current
-  provider and client documentation when identifying credential names and aliases, as these can
-  change over time. Literal credentials in a repo-owned `WORKFLOW.md` remain readable to a child
-  with workspace access and SHOULD NOT be used when this isolation matters.
-- Unsupported tool names MUST return a structured failure result using the targeted protocol and
-  continue the session.
-- Each adapter that ships tools MUST document:
-  - tool names and input schemas;
-  - whether a tool can mutate tracker state;
-  - scope/authorization behavior;
-  - result and error semantics;
-  - any provider-side idempotency or rate-limit expectations.
+- An adapter MAY expose provider-native tools through RPC `set_host_tools`. Each definition includes
+  a unique `name`, `description`, and JSON Schema `parameters` valid for the targeted protocol.
+- Tool definitions, adapter selection, and effective tracker settings MUST be bound to one session
+  snapshot. Reloads apply to future sessions, not the provider/authentication of an in-flight call.
+- The runtime MUST handle `host_tool_call` host-side using the active adapter configuration and
+  return a `host_tool_result` with the request's `id`.
+- Tool failures, invalid arguments, missing authentication, and unsupported names MUST return
+  structured error content with top-level `isError: true`, without stalling the session.
+- The runtime MUST honor `host_tool_cancel` for pending calls and document cancellation semantics
+  for mutations that may already have reached the provider.
+- The child MUST NOT need raw tracker tokens on disk or in its environment. Adapters MUST declare
+  authentication-related environment names for removal from local and remote child environments.
+- Pass the normalized issue, including `id` and `native_ref`, as internal tool execution context.
+- Tool names, schemas, scope/authorization, mutation capability, results, errors, idempotency, and
+  provider rate limits are adapter-owned and MUST be documented when tools ship.
 
 Minimal language-neutral adapter hooks for this OPTIONAL extension:
 
@@ -1127,30 +1100,24 @@ secret_environment_names() -> list<string>
 execute_agent_tool(name, arguments, context={issue}) -> ToolResult
 ```
 
-`ToolResult` MUST distinguish success from failure and carry JSON-safe structured output that can
-be translated to the targeted app-server protocol. The context contains the normalized issue, never
-the credential.
-
-User-input-required policy:
-
-- Implementations MUST document how targeted-protocol user-input-required signals are handled.
-- A run MUST NOT stall indefinitely waiting for user input.
-- A conforming implementation MAY fail the run, surface the request to an operator, satisfy it
-  through an approved operator channel, or auto-resolve it according to its documented policy.
-- The example high-trust behavior above fails user-input-required turns immediately.
+`ToolResult` MUST distinguish success from failure and carry JSON-safe output translated into
+the RPC result's `content` and OPTIONAL `details`. The context contains the issue, never the
+credential. Literal credentials in a workspace-readable `WORKFLOW.md` defeat this isolation and
+SHOULD NOT be used.
 
 ### 10.6 Timeouts and Error Mapping
 
 Timeouts:
 
-- `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: maximum silence interval while a turn stream is active; each
-  app-server output resets it, so it is not a total turn runtime cap
-- `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
+- `omp.read_timeout_ms`: wait for readiness and command responses during startup/sync requests,
+  including prompt admission; it is not the deadline for prompt completion.
+- `omp.turn_timeout_ms`: maximum silence interval while a prompt or its background activity is
+  active; each RPC output resets it, so it is not a total turn runtime cap.
+- `omp.stall_timeout_ms`: enforced by the orchestrator based on event inactivity.
 
-Error mapping (RECOMMENDED normalized categories):
+RECOMMENDED normalized error categories:
 
-- `codex_not_found`
+- `omp_not_found`
 - `invalid_workspace_cwd`
 - `response_timeout`
 - `turn_timeout`
@@ -1159,22 +1126,19 @@ Error mapping (RECOMMENDED normalized categories):
 - `turn_failed`
 - `turn_cancelled`
 - `turn_input_required`
+- `protocol_error`
 
 ### 10.7 Agent Runner Contract
 
-The `Agent Runner` wraps workspace + prompt + app-server client.
+The `Agent Runner` wraps workspace + prompt + oh-my-pi RPC client.
 
-Behavior:
+1. Create/reuse the issue workspace.
+2. Build the prompt from the workflow template.
+3. Start the RPC session.
+4. Forward normalized RPC events to the orchestrator.
+5. On any error, fail the worker attempt; the orchestrator owns retries.
 
-1. Create/reuse workspace for issue.
-2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
-5. On any error, fail the worker attempt (the orchestrator will retry).
-
-Note:
-
-- Workspaces are intentionally preserved after successful runs.
+Workspaces are intentionally preserved after successful runs.
 
 ## 11. Issue Tracker Integration Contract
 
@@ -1321,6 +1285,122 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
 
+### 11.6 GitHub Projects Board Profile (REQUIRED)
+
+The required adapter is `tracker.kind: github_projects`. A board is a view of a GitHub Projects
+`ProjectV2` project; Symphony schedules from project items and their Status values, not from a
+particular view's visual layout or filters. Projects (classic) are not part of this profile.
+
+API reference:
+[Using the API to manage Projects](https://docs.github.com/en/issues/planning-and-tracking-with-projects/automating-your-project/using-the-api-to-manage-projects).
+
+#### 11.6.1 Provider Configuration
+
+`tracker.provider` keys:
+
+- `project_id` (non-empty string, REQUIRED): GraphQL node ID of the `ProjectV2` project, not its
+  numeric URL project number. Resolve it from `organization(login).projectV2(number).id` or
+  `user(login).projectV2(number).id` during setup.
+- `endpoint` (HTTPS URL): default `https://api.github.com/graphql`; deployments MAY configure the
+  corresponding GitHub Enterprise GraphQL endpoint.
+- `api_key` (secret string or `$VAR_NAME`): host-side GitHub credential. If omitted, resolve
+  `GH_TOKEN`, then `GITHUB_TOKEN`, taking the first non-empty value. An explicit empty or unresolved
+  value is a missing secret, not permission to fall back.
+- `status_field` (non-empty string): default `Status`; identifies one project single-select field
+  by its exact name. A missing, ambiguous, or non-single-select field is a configuration error.
+
+Default active states are `["Todo", "In Progress"]`; default terminal states are `["Done"]`.
+Workflows using other board columns MUST configure their option names explicitly. Validate that
+every configured state matches an option in the selected field after scheduler normalization;
+do not translate unknown states into issue `OPEN` or `CLOSED` values.
+
+Authentication MUST authorize reading the project and the issues in its repositories. Classic
+personal access tokens need `read:project` for reads or `project` for mutations, plus applicable
+repository access for private issues. Fine-grained tokens and GitHub Apps MUST have corresponding
+Projects and repository permissions for the operations they perform. Project access alone does
+not imply access to private issue content.
+
+Declare `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, and any
+environment name referenced by `api_key` as tracker-secret environment names. Keep this credential
+host-side and distinct from any model-provider authentication required by oh-my-pi.
+
+Example `WORKFLOW.md`:
+
+```yaml
+---
+tracker:
+  kind: github_projects
+  provider:
+    project_id: $GITHUB_PROJECT_ID
+    api_key: $GITHUB_TOKEN
+    status_field: Status
+  active_states: [Todo, In Progress]
+  terminal_states: [Done]
+polling:
+  interval_ms: 30000
+omp:
+  command: omp --mode rpc --no-ui
+---
+Work on GitHub issue {{ issue.identifier }}: {{ issue.title }}.
+{{ issue.description }}
+```
+
+`project_id` also supports `$VAR_NAME` resolution; the example requires `GITHUB_PROJECT_ID` to
+contain a real project node ID and `GITHUB_TOKEN` to contain an authorized host-side credential.
+
+#### 11.6.2 Reads, Scope, and Normalization
+
+- Fetch items through `node(id: project_id) { ... on ProjectV2 { items(...) } }`.
+  Paginate using `pageInfo.hasNextPage` and `endCursor`; use at most 100 nodes per connection page.
+  Fully paginate any required nested connections, including labels and field metadata/values,
+  rather than silently using only the first page.
+- `fetch_issues_by_states` scans the configured project's items and filters by the selected Status
+  field locally. GitHub's project-items connection is not assumed to support a state predicate.
+- `fetch_issues_by_ids` resolves `ProjectV2Item` node IDs in bounded batches, verifies project
+  membership, and returns full snapshots, including current Status, labels, and eligibility.
+- Only items whose accessible `content` is a GitHub `Issue` are schedulable in this profile.
+  Pull requests, draft items, and inaccessible/deleted content are outside its scope and omitted.
+  Removed items and items belonging to another project are omitted on refresh.
+- Normalize `id` from the `ProjectV2Item.id`, not `Issue.id`.
+- Normalize `native_ref` as `{project_id, project_item_id, issue_id, repository, issue_number}`,
+  where `repository` is `owner/name`; these are non-secret references for provider-native tools.
+- Normalize `identifier` as `<owner>/<repository>#<number>` to disambiguate issues across
+  repositories. Workspace naming still follows Section 4.2 sanitization and hash-suffix rules.
+- Map `title`, `description`, `url`, `created_at`, and `updated_at` from the issue's title, body,
+  URL, and timestamps. Map labels through Section 11.3. Choose the lexicographically smallest
+  assignee node ID for `assignee_id`, or null when unassigned; this does not impose an assignee filter.
+- Map `state` from the configured project's single-select Status option name. Missing Status is
+  a malformed required field: omit/log it in state-list reads and fail a requested ID refresh,
+  as specified in Section 11.1.
+- Set `priority` and `branch_name` to null and `blocked_by` to `[]`; this profile does not infer
+  priorities, branches, or blocker relationships from labels or text.
+- Set `dispatchable=true` only for unarchived items with an open, unlocked issue in the configured
+  project. Otherwise return a valid issue with `dispatchable=false` when its content and Status
+  remain readable. State-list reads include readable archived/closed terminal items so startup
+  cleanup can still find their workspaces.
+- Closing an issue does not imply that its board Status becomes `Done`. Board Status remains the
+  workflow state; issue closure only prevents dispatch/continuation.
+- Treat GraphQL `errors` as failures even with HTTP 200; never hand a partial page/result to the
+  scheduler. Apply the atomic pagination/error rules in Section 11.1.
+
+Map invalid project/field/state configuration to `invalid_tracker_config`, missing credentials to
+`missing_tracker_secret`, transport failures to `tracker_request`, non-success HTTP responses to
+`tracker_status`, malformed GraphQL payloads or non-rate-limit GraphQL errors to `tracker_response`,
+invalid/repeated cursors to `tracker_pagination`, and provider-identified rate limiting to
+`tracker_rate_limited`. Preserve a human-readable message without exposing the credential.
+
+#### 11.6.3 Board Updates Through Agent Tools
+
+When provider-native host tools are shipped, board transitions use
+`updateProjectV2ItemFieldValue` with the configured `projectId`, `itemId`, Status `fieldId`, and
+`value.singleSelectOptionId`. Resolve the option ID from the intended Status name; never treat an
+option's display name as its ID. Issue comments and issue closure operate on the underlying issue
+ID instead. A board transition and an issue close/reopen are distinct operations.
+
+The host MUST verify that a tool's target belongs to the configured project before reading or
+mutating it. Advertise only the adapter's documented operations and authorize them with the
+host-side credential through the RPC host-tool mechanism in Section 10.5.
+
 ## 12. Prompt Construction and Context Assembly
 
 ### 12.1 Inputs
@@ -1396,7 +1476,7 @@ SHOULD return:
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
 - session and retry rows SHOULD include the tracker-provided issue URL when available
-- `codex_totals`
+- `omp_totals`
   - `input_tokens`
   - `output_tokens`
   - `total_tokens`
@@ -1420,17 +1500,21 @@ correctness.
 
 Token accounting rules:
 
-- Agent events can include token counts in multiple payload shapes.
-- Prefer absolute thread totals when available, such as:
-  - `thread/tokenUsage/updated` payloads
-  - `total_token_usage` within token-count wrapper events
-- Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
-- Extract input/output/total token counts leniently from common field names within the selected
-  payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
-- Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
-  way.
-- Accumulate aggregate totals in orchestrator state.
+- Use cumulative `get_session_stats` responses from the targeted oh-my-pi version as the
+  authoritative session totals. Refresh them after each settled Symphony turn and before normal
+  shutdown; implementations MAY also refresh during streaming for live status.
+- Normalize `data.tokens.input`, `data.tokens.output`, and `data.tokens.total` into
+  `input_tokens`, `output_tokens`, and `total_tokens`. Cache/reasoning breakdowns MAY be exposed
+  separately; do not assume `total_tokens` equals input plus output for every provider.
+- Track deltas relative to the last reported totals for the same `omp_session_id` to avoid
+  double-counting repeated snapshots. If resuming a session, record its starting totals as a
+  baseline so earlier attempts are not counted again.
+- Streaming `message_update`, `message_end`, and `agent_end` can repeat the same usage. They MUST
+  NOT be added again on top of the authoritative cumulative statistics.
+- If live counts are derived from messages, deduplicate them by stable message identity and
+  reconcile them with session statistics rather than treating every frame as new consumption.
+- Reset session baselines when the native session ID changes and accumulate only new consumption
+  in orchestrator state.
 
 Runtime accounting:
 
@@ -1444,7 +1528,8 @@ Runtime accounting:
 
 Rate-limit tracking:
 
-- Track the latest rate-limit payload seen in any agent update.
+- Track the latest provider rate-limit payload only when the targeted integration exposes it.
+- Use `null` when unavailable; oh-my-pi RPC does not guarantee a rate-limit snapshot event.
 - Any human-readable presentation of rate-limit data is implementation-defined.
 
 ### 13.6 Humanized Agent Event Summaries (OPTIONAL)
@@ -1513,11 +1598,11 @@ Minimum endpoints:
       },
       "running": [
         {
-          "issue_id": "abc123",
-          "issue_identifier": "MT-649",
-          "issue_url": "https://tracker.example/issues/MT-649",
+          "issue_id": "PVTI_example649",
+          "issue_identifier": "octo-org/example#649",
+          "issue_url": "https://github.com/octo-org/example/issues/649",
           "state": "In Progress",
-          "session_id": "thread-1-turn-1",
+          "session_id": "omp-session-1-prompt-7",
           "turn_count": 7,
           "last_event": "turn_completed",
           "last_message": "",
@@ -1532,15 +1617,15 @@ Minimum endpoints:
       ],
       "retrying": [
         {
-          "issue_id": "def456",
-          "issue_identifier": "MT-650",
-          "issue_url": "https://tracker.example/issues/MT-650",
+          "issue_id": "PVTI_example650",
+          "issue_identifier": "octo-org/example#650",
+          "issue_url": "https://github.com/octo-org/example/issues/650",
           "attempt": 3,
           "due_at": "2026-02-24T20:16:00Z",
           "error": "no available orchestrator slots"
         }
       ],
-      "codex_totals": {
+      "omp_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,
         "total_tokens": 7400,
@@ -1553,22 +1638,25 @@ Minimum endpoints:
 - `GET /api/v1/<issue_identifier>`
   - Returns issue-specific runtime/debug details for the identified issue, including any information
     the implementation tracks that is useful for debugging.
+  - Percent-encode the entire identifier as one path parameter. For example,
+    `octo-org/example#649` uses `/api/v1/octo-org%2Fexample%23649`; the server MUST recover the
+    original identifier without interpreting its encoded slash as another route segment.
   - Suggested response shape:
 
     ```json
     {
-      "issue_identifier": "MT-649",
-      "issue_id": "abc123",
+      "issue_identifier": "octo-org/example#649",
+      "issue_id": "PVTI_example649",
       "status": "running",
       "workspace": {
-        "path": "/tmp/symphony_workspaces/MT-649"
+        "path": "/tmp/symphony_workspaces/octo-org_example_649_25205aad6040fe60"
       },
       "attempts": {
         "restart_count": 1,
         "current_retry_attempt": 2
       },
       "running": {
-        "session_id": "thread-1-turn-1",
+        "session_id": "omp-session-1-prompt-7",
         "turn_count": 7,
         "state": "In Progress",
         "started_at": "2026-02-24T20:10:12Z",
@@ -1583,10 +1671,10 @@ Minimum endpoints:
       },
       "retry": null,
       "logs": {
-        "codex_session_logs": [
+        "omp_session_logs": [
           {
             "label": "latest",
-            "path": "/var/log/symphony/codex/MT-649/latest.log",
+            "path": "/var/log/symphony/omp/octo-org_example_649_25205aad6040fe60/latest.log",
             "url": null
           }
         ]
@@ -1770,7 +1858,7 @@ Implications:
 
 ### 15.5 Harness Hardening Guidance
 
-Running Codex agents against repositories, issue trackers, and other inputs that can contain
+Running oh-my-pi agents against repositories, issue trackers, and other inputs that can contain
 sensitive data or externally-controlled content can be dangerous. A permissive deployment can lead
 to data leaks, destructive mutations, or full machine compromise if the agent is induced to execute
 harmful commands or use overly-powerful integrations.
@@ -1782,10 +1870,10 @@ arguments are fully trustworthy just because they originate inside a normal work
 
 Possible hardening measures include:
 
-- Tightening Codex approval and sandbox settings described elsewhere in this specification instead
-  of running with a maximally permissive configuration.
-- Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
-  separate credentials beyond the built-in Codex policy controls.
+- Restricting oh-my-pi's enabled tools and configuring its supported approval controls instead of
+  enabling unrestricted automatic approval.
+- Adding OS/container/VM sandboxing, network restrictions, or separate credentials; headless RPC
+  mode and workspace cwd selection do not provide an OS security boundary.
 - Filtering which issues, projects, boards, teams, labels, or other tracker sources are eligible
   for dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
 - Narrowing provider-native tools so they can only read or mutate data inside the intended tracker
@@ -1813,8 +1901,8 @@ function start_service():
     claimed: set(),
     retry_attempts: {},
     completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-    codex_rate_limits: null
+    omp_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+    omp_rate_limits: null
   }
 
   validation = validate_dispatch_config()
@@ -1910,13 +1998,13 @@ function dispatch_issue(issue, state, attempt):
     identifier: issue.identifier,
     issue,
     session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
+    omp_pid: null,
+    last_omp_message: null,
+    last_omp_event: null,
+    last_omp_timestamp: null,
+    omp_input_tokens: 0,
+    omp_output_tokens: 0,
+    omp_total_tokens: 0,
     last_reported_input_tokens: 0,
     last_reported_output_tokens: 0,
     last_reported_total_tokens: 0,
@@ -1940,7 +2028,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
-  session = app_server.start_session(workspace=workspace.path)
+  session = omp_rpc.start_session(workspace=workspace.path)
   if session failed:
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
@@ -1951,25 +2039,28 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   while true:
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
-      app_server.stop_session(session)
+      omp_rpc.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("prompt error")
 
-    turn_result = app_server.run_turn(
+    turn_result = omp_rpc.run_turn(
       session=session,
       prompt=prompt,
       issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+      on_message=(msg) -> send(orchestrator_channel, {omp_update, issue.id, msg})
     )
 
     if turn_result failed:
-      app_server.stop_session(session)
+      omp_rpc.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("agent turn error")
 
+    # run_turn returns success only after prompt completion, session quiescence,
+    # and the session-statistics refresh described in Sections 10.3 and 13.5.
+
     refreshed_issue = tracker.fetch_issues_by_ids([issue.id])
     if refreshed_issue failed:
-      app_server.stop_session(session)
+      omp_rpc.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
 
@@ -1986,7 +2077,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     turn_number = turn_number + 1
 
-  app_server.stop_session(session)
+  omp_rpc.stop_session(session)
   run_hook_best_effort("after_run", workspace.path)
 
   exit_normal()
@@ -2078,7 +2169,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `tracker.provider` preserves adapter-owned keys and validates them through the selected adapter
 - `$VAR` resolution works for documented adapter secret keys and path values
 - `~` path expansion works
-- `codex.command` is preserved as a shell command string
+- `omp.command` is preserved as a shell command string
 - Per-state concurrency override map normalizes state names and ignores invalid values
 - Prompt template renders `issue` and `attempt`
 - Prompt rendering fails on unknown variables (strict mode)
@@ -2118,6 +2209,12 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   portable error mapping
 - Error mapping covers config, request, non-success response, malformed payload, pagination, and
   rate limiting, including documented category/message mappings for language-native errors
+- GitHub Projects config resolves project node ID/auth and validates the single-select Status field
+- Board Status, not issue `OPEN`/`CLOSED`, drives active/terminal workflow states
+- Multi-repository identifiers remain unique; project-item IDs retain distinct underlying issue IDs
+- PR/draft/inaccessible items are excluded, while archived/closed issues cannot dispatch
+- Missing Status follows malformed-record rules rather than inventing a state
+- Refresh rejects out-of-project items; pagination and GraphQL errors never produce partial success
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
@@ -2138,28 +2235,29 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
 
-### 17.5 Coding-Agent App-Server Client
+### 17.5 Oh-my-pi RPC Client
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
-- Session startup follows the targeted Codex app-server protocol.
-- Client identity/capability payloads are valid when the targeted Codex app-server protocol requires
-  them.
-- Policy-related startup payloads use the implementation's documented approval/sandbox settings
-- Thread and turn identities exposed by the targeted protocol are extracted and used to emit
-  `session_started`
-- Request/response read timeout is enforced
-- Turn timeout is enforced
-- Transport framing required by the targeted protocol is handled correctly
-- For stdio-based transports, diagnostic stderr handling is kept separate from the protocol stream
-- Command/file-change approvals are handled according to the implementation's documented policy
-- Unsupported dynamic tool calls are rejected without stalling the session
-- User input requests are handled according to the implementation's documented policy and do not
-  stall indefinitely
-- Usage and rate-limit telemetry exposed by the targeted protocol is extracted
-- Approval, user-input-required, usage, and rate-limit signals are interpreted according to the
-  targeted protocol
-- If client-side tools are implemented, session startup advertises the supported tool specs
-  using the targeted app-server protocol
+- Launch uses workspace cwd and `bash -lc <omp.command>` without tracker secrets in the child env
+- Startup waits for `ready`, respects advertised frame limits, and negotiates supported v2 framing
+- Chunk reassembly rejects invalid order, lengths, UTF-8, and interrupted sequences
+- Fresh/resumed sessions remain bound to the intended issue; cancelled transitions fail startup
+- `get_state.data.sessionId` and host-generated prompt IDs produce correct session/turn metadata
+- Responses and prompt results are correlated by request ID despite interleaved events
+- A prompt acknowledgement does not complete a turn
+- Local-only `data.agentInvoked: false` completion does not wait for a nonexistent prompt result
+- `prompt_result.status` distinguishes success, error, and abort
+- A completed prompt with pending async work waits for session quiescence; background failures
+  still fail the attempt
+- Continuations reuse the same process/session and do not resend the original prompt
+- Request-response, stream-silence, and orchestrator stall timeouts are enforced separately
+- Protocol stdout and diagnostic stderr are handled separately
+- Headless approval defaults and interactive UI requests follow the documented policy without
+  stalling; headless mode is not assumed to approve everything
+- Cancellation aborts active work; bounded shutdown drains stdout after stdin closes
+- Usage extraction follows cumulative session statistics; unavailable rate limits remain null
+- If client-side host tools are implemented, startup registers them using `set_host_tools`
+- If client-side host tools are implemented, `host_tool_call` results/errors preserve request IDs
+  and `host_tool_cancel` cancels pending execution
 - If provider-native agent tools are implemented:
   - only the selected adapter's tools are advertised to the session
   - valid inputs execute host-side with configured adapter auth
@@ -2216,12 +2314,12 @@ Use the same validation profiles as Section 17:
 - Typed config layer with defaults and `$` resolution
 - Dynamic `WORKFLOW.md` watch/reload/re-apply for config and prompt
 - Polling orchestrator with single-authority mutable state
-- Issue tracker adapter with state-list + ID-refresh reads
+- GitHub Projects board adapter with state-list + project-item ID-refresh reads (Section 11.6)
 - Workspace manager with sanitized, collision-resistant per-issue workspaces
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
-- Coding-agent app-server subprocess client with the targeted transport/framing protocol
-- Codex launch command config (`codex.command`, default `codex app-server`)
+- Oh-my-pi RPC subprocess client with the targeted JSONL/framing protocol
+- Oh-my-pi launch command config (`omp.command`, default `omp --mode rpc --no-ui`)
 - Strict prompt rendering with `issue` and `attempt` variables
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
@@ -2234,7 +2332,7 @@ Use the same validation profiles as Section 17:
 
 - HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- Provider-native agent tools, when shipped, execute through the app-server session using
+- Provider-native agent tools, when shipped, execute through the oh-my-pi RPC host-tool protocol using
   host-side configured adapter auth without passing tracker secrets to the child.
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
@@ -2269,7 +2367,7 @@ Extension config:
 - Each worker run is assigned to one host at a time, and that host becomes part of the run's
   effective execution identity along with the issue workspace.
 - `workspace.root` is interpreted on the remote host, not on the orchestrator host.
-- The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
+- The oh-my-pi RPC process is launched over SSH stdio instead of as a local subprocess, so the
   orchestrator still owns the session lifecycle even though commands execute remotely.
 - Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
 - A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
